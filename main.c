@@ -20,19 +20,23 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- **/
+ */
 
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <string.h>
+#include <pthread.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <linux/mman.h>
 #include <openssl/conf.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
-#include <unistd.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <pthread.h>
-#include <errno.h>
 
 #define KEY_SIZE        256
 #define IV_SIZE         128
@@ -42,17 +46,38 @@
 #define IV_LEN_BYTES    (IV_SIZE/8)
 #define SALT_LEN_BYTES  (SALT_SIZE/8)
 
-#define ENC_CHUNK_SIZE  (1024 * 1024 * 32)
+/**
+ * ENC_PLAINTEXT_SIZE:
+ *
+ *      For encryption use 32M chunks (or the remainder of input file)
+ */
+#define ENC_PLAINTEXT_SIZE   (1UL << 25)
 
 /**
- * To account for additional data during encryption, the chunk buffer size
- * is slightly larger than the input chunk size.  From EVP_EncryptUpdate:
+ * ENC_FINAL_CHUNK_SIZE:
  *
- * "... the amount of data written can be anything from zero bytes
- * to (inl + cipher_block_size - 1) bytes."
+ *      For encryption, each chunk of plaintext will become size of
+ *      ENC_FINAL_CHUNK_SIZE after encryption and encoding; it consists
+ *      of:
+ *
+ *          - This chunk's initialization vector, in binary cleartext;
+ *          - This chunk's key salt, in binary clear text;
+ *          - ENC_PLAINTEXT_SIZE of cipher text, since ENC_PLAINTEXT_SIZE
+ *            is divisible by AES CBC block size of 16 bytes; therefore,
+ *          - extra 16 bytes of PKCS padding;
+ */
+#define ENC_FINAL_CHUNK_SIZE (IV_LEN_BYTES + SALT_LEN_BYTES + \
+                              ENC_PLAINTEXT_SIZE + 16)
+
+/**
+ * CHUNK_BUF_SIZE:
+ *
+ *      Each thread's per-chunk scratch buffer for decryption.  It is
+ *      ceil'd to the next 4KB page boundary for memory allocation
+ *      alignment.
  */
 #define PAGE_SIZE       (1U << 12)
-#define CHUNK_BUF_SIZE  ((ENC_CHUNK_SIZE + PAGE_SIZE) & ~(PAGE_SIZE - 1))
+#define CHUNK_BUF_SIZE  ((ENC_FINAL_CHUNK_SIZE + PAGE_SIZE) & ~(PAGE_SIZE - 1))
 
 #define KDF_ITER        10000
 #define EVP_OK          1
@@ -60,7 +85,7 @@
 #define CHECK(_stmt, _msg)                          \
     do {                                            \
         if (!(_stmt)) {                             \
-            fprintf(stderr, (_msg));                \
+            fprintf(stderr, (_msg "\n"));           \
             exit(1);                                \
         }                                           \
     } while (0)
@@ -90,17 +115,15 @@
     } while (0)
 
 
-static pthread_mutex_t read_lock;
-static pthread_mutex_t write_lock;
-static pthread_cond_t write_cond;
-
-static FILE *in_fp;
-static FILE *out_fp;
 static char enc;
 static char verbose;
 static char *pass;
-static unsigned sequence;
-static unsigned next_write_sequence;
+static unsigned char *in_mmap_addr;
+static unsigned char *out_mmap_addr;
+static size_t in_fsize;
+static size_t out_fsize_actual;
+static size_t out_fsize_max;
+static volatile unsigned sequence_num;
 
 void gen_256_key(         char *passphrase, int p_len,
                  unsigned char *salt,       int s_len,
@@ -127,13 +150,14 @@ void aes_256_cbc_encrypt(unsigned char *plaintext,  int plaintext_len,
 
     CHECK_OPENSSL((ctx = EVP_CIPHER_CTX_new()) != NULL);
     CHECK_OPENSSL(EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) == EVP_OK);
-    CHECK_OPENSSL(EVP_EncryptUpdate(ctx, ciphertext, &written, plaintext, plaintext_len) == EVP_OK);
+    CHECK_OPENSSL(EVP_EncryptUpdate(ctx, ciphertext, &written,
+                                    plaintext, plaintext_len) == EVP_OK);
     *ciphertext_len = written;
-    CHECK(*ciphertext_len >= 0, "Unexpected EVP return value.\n");
+    CHECK(*ciphertext_len >= 0, "Unexpected EVP return value.");
 
     CHECK_OPENSSL(EVP_EncryptFinal_ex(ctx, ciphertext + written, &written) == EVP_OK);
     *ciphertext_len += written;
-    CHECK(*ciphertext_len >= 0, "Unexpected EVP return value.\n");
+    CHECK(*ciphertext_len >= 0, "Unexpected EVP return value.");
 
     EVP_CIPHER_CTX_free(ctx);
 }
@@ -147,59 +171,64 @@ void aes_256_cbc_decrypt(unsigned char *ciphertext, int ciphertext_len,
 
     CHECK_OPENSSL((ctx = EVP_CIPHER_CTX_new()) != NULL);
     CHECK_OPENSSL(EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) == EVP_OK);
-    CHECK_OPENSSL(EVP_DecryptUpdate(ctx, plaintext, &written, ciphertext, ciphertext_len) == EVP_OK);
+    CHECK_OPENSSL(EVP_DecryptUpdate(ctx, plaintext, &written,
+                                    ciphertext, ciphertext_len) == EVP_OK);
     *plaintext_len = written;
-    CHECK(*plaintext_len >= 0, "Unexpected EVP return value.\n");
+    CHECK(*plaintext_len >= 0, "Unexpected EVP return value.");
 
     CHECK_OPENSSL(EVP_DecryptFinal_ex(ctx, plaintext + written, &written) == EVP_OK);
     *plaintext_len += written;
-    CHECK(*plaintext_len >= 0, "Unexpected EVP return value.\n");
+    CHECK(*plaintext_len >= 0, "Unexpected EVP return value.");
 
     EVP_CIPHER_CTX_free(ctx);
 }
 
 static void *worker(void *unused)
 {
-    unsigned char *input_data;
-    unsigned char *output_data;
+    unsigned char *in_start_addr, *out_start_addr, *scratch;
     unsigned char salt[SALT_LEN_BYTES];
     unsigned char iv[IV_LEN_BYTES];
     unsigned char key[KEY_LEN_BYTES];
-    unsigned bytes_read, bytes_written;
-    unsigned curr_chunk_size;
-    unsigned my_seq;
+    unsigned bytes_in_exp, bytes_in_actual;
+    unsigned bytes_out_exp;
+    unsigned bytes_written;
+    unsigned long read_offset;
+    volatile unsigned my_seq;
 
-    CHECK_ERRNO(posix_memalign( (void **)&input_data, PAGE_SIZE, CHUNK_BUF_SIZE) == 0, "posix_memalign(): ");
-    CHECK_ERRNO(posix_memalign((void **)&output_data, PAGE_SIZE, CHUNK_BUF_SIZE) == 0, "posix_memalign(): ");
+    bytes_in_exp  = enc ? ENC_PLAINTEXT_SIZE   : ENC_FINAL_CHUNK_SIZE;
+    bytes_out_exp = enc ? ENC_FINAL_CHUNK_SIZE : ENC_PLAINTEXT_SIZE;
+
+    if (!enc) {
+        /**
+         * XXX: For decryption the data must be first written to a local buffer instead
+         *      of the mmap'd region directly.  This is because the decrypted text
+         *      initially contains padding that will be truncated by the finalize
+         *      function; only then can we transfer the result to the output memory
+         *      location, otherwise we'd end up corrupting next chunk's data. 
+         */
+        CHECK_ERRNO(posix_memalign((void **)&scratch, PAGE_SIZE, CHUNK_BUF_SIZE) == 0, "posix_memalign");
+    }
 
     while (1) {
-        CHECK_ERRNO(pthread_mutex_lock(&read_lock) == 0, "pthread_mutex_lock (read): ");
-        if((bytes_read = fread(input_data, 1, enc ? ENC_CHUNK_SIZE : 4, in_fp)) > 0) {
-            my_seq = sequence++;
-            if (!enc) {
-                curr_chunk_size = *(unsigned *)input_data;
-                CHECK(curr_chunk_size < CHUNK_BUF_SIZE, "Input chunk is too large to fit in buffer.\n");
-
-                bytes_read = fread(input_data + 4, 1, curr_chunk_size - 4, in_fp);
-                CHECK(bytes_read == curr_chunk_size - 4, "Unable to read from file input.\n");
-            }
-        }
-        CHECK_ERRNO(pthread_mutex_unlock(&read_lock) == 0, "pthread_mutex_unlock (read): ");
-        if (bytes_read == 0) {
+        my_seq = __atomic_fetch_add(&sequence_num, 1, __ATOMIC_SEQ_CST);
+        read_offset = (unsigned long)my_seq * bytes_in_exp;
+        if (read_offset >= in_fsize) {
             break;
         }
+        in_start_addr  = in_mmap_addr + read_offset;
+        out_start_addr = out_mmap_addr + bytes_out_exp * my_seq;
+
+        bytes_in_actual = read_offset + bytes_in_exp < in_fsize ? bytes_in_exp : in_fsize - read_offset;
 
         /**
          * For each chunk for encryption, data is stored back to disk in this format:
          *
-         *      +------------------+----+------+--------------------+
-         *      | Total chunk size | IV | Salt | Encrypted data ... |
-         *      +------------------+----+------+--------------------+
+         *      +----+------+--------------------+
+         *      | IV | Salt | Encrypted data ... |
+         *      +----+------+--------------------+
          *
          * where:
          *
-         *      - Total chunk size (4B): the total size of this chunk in bytes, including
-         *                               the field itself.
          *      - IV                   : initialization vector in byte array, with length
          *                               of IV_LEN_BYTES.
          *      - Salt                 : salt used for key derivation in byte array, with
@@ -211,39 +240,33 @@ static void *worker(void *unused)
             CHECK(RAND_bytes(salt, sizeof salt) == EVP_OK, "Failed to retrieve nonce");
             CHECK(RAND_bytes(  iv,   sizeof iv) == EVP_OK, "Failed to retrieve nonce");
             gen_256_key(pass, strlen(pass), salt, sizeof salt, key);
-            aes_256_cbc_encrypt(input_data, bytes_read, key, iv,
-                                output_data + IV_LEN_BYTES + SALT_LEN_BYTES + 4, (int *)&bytes_written);
-            curr_chunk_size = IV_LEN_BYTES + SALT_LEN_BYTES + bytes_written + 4;
+            aes_256_cbc_encrypt(in_start_addr, bytes_in_actual, key, iv,
+                                out_start_addr + IV_LEN_BYTES + SALT_LEN_BYTES, (int *)&bytes_written);
+            CHECK(bytes_written == ENC_PLAINTEXT_SIZE + 16 || bytes_in_exp > bytes_in_actual,
+                  "Unexpected cipher text length.");
 
-            memcpy((void *)output_data, (void *)&curr_chunk_size, 4);
-            memcpy((void *)output_data + 4, (void *)iv, IV_LEN_BYTES);
-            memcpy((void *)output_data + 4 + IV_LEN_BYTES, (void *)salt, SALT_LEN_BYTES);
+            memcpy((void *)out_start_addr, (void *)iv, IV_LEN_BYTES);
+            memcpy((void *)out_start_addr + IV_LEN_BYTES, (void *)salt, SALT_LEN_BYTES);
+
+            bytes_written += IV_LEN_BYTES + SALT_LEN_BYTES;
         } else {
-            memcpy((void *)iv, (void *)(input_data + 4), IV_LEN_BYTES);
-            memcpy((void *)salt, (void *)(input_data + 4 + IV_LEN_BYTES), SALT_LEN_BYTES);
+            memcpy((void *)iv, (void *)in_start_addr, IV_LEN_BYTES);
+            memcpy((void *)salt, (void *)(in_start_addr + IV_LEN_BYTES), SALT_LEN_BYTES);
             gen_256_key(pass, strlen(pass), salt, sizeof salt, key);
-            aes_256_cbc_decrypt(input_data + 4 + IV_LEN_BYTES + SALT_LEN_BYTES,
-                                curr_chunk_size - 4 - IV_LEN_BYTES - SALT_LEN_BYTES,
-                                key, iv, output_data, (int *)&bytes_written);
-            curr_chunk_size = bytes_written;
+            aes_256_cbc_decrypt(in_start_addr + IV_LEN_BYTES + SALT_LEN_BYTES,
+                                bytes_in_actual - IV_LEN_BYTES - SALT_LEN_BYTES,
+                                key, iv, scratch, (int *)&bytes_written);
+            memcpy((void *)out_start_addr, (void *)scratch, bytes_written);
+            CHECK(bytes_written == ENC_PLAINTEXT_SIZE || bytes_in_exp > bytes_in_actual,
+                  "Unexpected plaintext length.");
         }
+        __atomic_fetch_add(&out_fsize_actual, bytes_written, __ATOMIC_SEQ_CST);
 
         if (verbose) {
-            printf("Chunk %5u: encoded size %10u S/IV: ", my_seq, curr_chunk_size);
+            printf("Chunk %5u: encoded size %10u S/IV: ", my_seq, bytes_written);
             PRINT_STATIC_BYTES(salt); printf("/"); PRINT_STATIC_BYTES(iv);
             printf("\n");
         }
-
-        CHECK_ERRNO(pthread_mutex_lock(&write_lock) == 0, "pthread_mutex_lock (write): ");
-        while (next_write_sequence != my_seq) {
-            CHECK_ERRNO(pthread_cond_wait(&write_cond, &write_lock) == 0, "pthread_cond_wait: ");
-        }
-
-        fwrite(output_data, 1, curr_chunk_size, out_fp);
-        next_write_sequence++;
-
-        CHECK_ERRNO(pthread_mutex_unlock(&write_lock) == 0, "pthread_mutex_unlock (write): ");
-        CHECK_ERRNO(pthread_cond_broadcast(&write_cond) == 0, "pthread_cond_broadcast: ");
     }
 
     /* Skip free's */
@@ -252,10 +275,11 @@ static void *worker(void *unused)
 
 int main(int argc, char **argv)
 {
-    int i, c;
+    int i, c, in_fd, out_fd;
     char *in_fname = NULL;
     char *out_fname = NULL;
     short concurrency = 0;
+    struct stat fs;
 
     pthread_t *threads;
 
@@ -282,11 +306,11 @@ int main(int argc, char **argv)
         }
     }
     if (concurrency == 0) {
-        concurrency = sysconf(_SC_NPROCESSORS_ONLN) * 2;
+        concurrency = sysconf(_SC_NPROCESSORS_ONLN);
     }
-    CHECK(optind < argc, "Missing mode (dec/enc).\n");
-    CHECK(in_fname && out_fname, "Missing input/output file.\n");
-    CHECK(concurrency > 0 && concurrency < 128, "Invalid job count.\n");
+    CHECK(optind < argc, "Missing mode (dec/enc).");
+    CHECK(in_fname && out_fname, "Missing input/output file.");
+    CHECK(concurrency > 0 && concurrency < 128, "Invalid job count.");
 
     if (strncmp("enc", argv[optind], 3) == 0) {
         enc = 1;
@@ -300,26 +324,41 @@ int main(int argc, char **argv)
     if (!pass) {
         pass = getpass("Passphrase: ");                     // XXX: getpass() obsolete
     }
-    CHECK(pass && strlen(pass), "invalid passphrase.\n");   // XXX: ascii only
+    CHECK(pass && strlen(pass), "invalid passphrase.");     // XXX: ascii only
 
-    CHECK_ERRNO((in_fp  = fopen(in_fname,  "rb")) != NULL, "Input file: ");
-    CHECK_ERRNO((out_fp = fopen(out_fname, "wb")) != NULL, "Output file: ");
+    in_fd = open(in_fname, O_RDONLY);
+    CHECK_ERRNO(in_fd != -1, "open()");
+    CHECK_ERRNO(fstat(in_fd, &fs) != -1, "fstat()");
+    in_fsize = fs.st_size;
+    in_mmap_addr = mmap(NULL, in_fsize, PROT_READ, MAP_PRIVATE | MAP_HUGE_2MB, in_fd, 0);
+    CHECK_ERRNO(in_mmap_addr != MAP_FAILED, "mmap() input");
+
+    out_fd = open(out_fname, O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
+    CHECK_ERRNO(out_fd != -1, "open()");
+
+    out_fsize_max = (in_fsize / ENC_FINAL_CHUNK_SIZE + 1) * ENC_FINAL_CHUNK_SIZE;
+    CHECK_ERRNO(posix_fallocate(out_fd, 0, out_fsize_max) == 0, "fallocate()");
+    out_mmap_addr = mmap(NULL, out_fsize_max, PROT_WRITE, MAP_SHARED | MAP_HUGE_2MB, out_fd, 0);
+    CHECK_ERRNO(out_mmap_addr != MAP_FAILED, "mmap() output");
 
     CHECK((threads = malloc(concurrency * sizeof(*threads))) != NULL,
-          "Unable to allocate pthreads.\n");
-
-    CHECK_ERRNO(pthread_mutex_init( &read_lock, NULL) == 0, "pthread_mutex_init (read): ");
-    CHECK_ERRNO(pthread_mutex_init(&write_lock, NULL) == 0, "pthread_mutex_init (write): ");
-    CHECK_ERRNO(pthread_cond_init( &write_cond, NULL) == 0, "pthread_cond_init: ");
+          "Unable to allocate pthreads.");
 
     for (i = 0; i < concurrency; i++) {
-        CHECK_ERRNO(pthread_create(&threads[i], NULL, worker, NULL) == 0, "pthread_create: ");
+        CHECK_ERRNO(pthread_create(&threads[i], NULL, worker, NULL) == 0, "pthread_create()");
     }
     for (i = 0; i < concurrency; i++) {
-        CHECK_ERRNO(pthread_join(threads[i], NULL) == 0, "pthread_join: ");
+        CHECK_ERRNO(pthread_join(threads[i], NULL) == 0, "pthread_join()");
     }
-    fclose(in_fp);
-    fclose(out_fp);
+
+    munmap(in_mmap_addr, in_fsize);
+    munmap(out_mmap_addr, out_fsize_max);
+
+    CHECK_ERRNO(ftruncate(out_fd, out_fsize_actual) == 0, "ftruncate()");
+    printf("Total bytes written: %lu\n", out_fsize_actual);
+
+    close(in_fd);
+    close(out_fd);
 
     /* Skip free's */
     return 0;

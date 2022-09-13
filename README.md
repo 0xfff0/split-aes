@@ -1,6 +1,6 @@
 ## split-aes
 
-"Speed up" AES CBC by splitting up large input file into smaller chunks and encrypt/decrypt in parallel:
+Speed up CBC mode AES by splitting input file into smaller chunks and encrypt/decrypt in parallel:
 
 - Chunk size 32M (arbitrary);
 - Each chunk uses a random IV and key salt, both of which are prefixed to the final encrypted blob;
@@ -12,10 +12,14 @@ This algorithm usually runs faster than single threaded AES CBC; however, it is 
 
 Install `libssl-dev`, or whatever your distribution specific package for libcrypto might be, then:
 
-`gcc main.c -lcrypto -lpthread`
+`gcc main.c -lcrypto -lpthread -Wall -Werror -O2`
 
 ### To run:
 
 Encrypt: `./a.out -i <input file> -o <output file> -j <job count> enc`
 
 Decrypt: `./a.out -i <input file> -o <output file> -j <job count> dec`
+
+### To test
+
+Run `./test.sh`
