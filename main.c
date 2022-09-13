@@ -233,8 +233,7 @@ static void *worker(void *unused)
          *                               of IV_LEN_BYTES.
          *      - Salt                 : salt used for key derivation in byte array, with
          *                               length of SALT_LEN_BYTES.
-         *      - Encrypted data       : encrypted data; the size of which can be
-         *                               calculated by (Total chunk size - 4 - IV - Salt)
+         *      - Encrypted data       : encrypted data; see notes on ENC_FINAL_CHUNK_SIZE.
          */ 
         if (enc) {
             CHECK(RAND_bytes(salt, sizeof salt) == EVP_OK, "Failed to retrieve nonce");
@@ -355,7 +354,9 @@ int main(int argc, char **argv)
     munmap(out_mmap_addr, out_fsize_max);
 
     CHECK_ERRNO(ftruncate(out_fd, out_fsize_actual) == 0, "ftruncate()");
-    printf("Total bytes written: %lu\n", out_fsize_actual);
+    if (verbose) {
+        printf("Total bytes written: %lu\n", out_fsize_actual);
+    }
 
     close(in_fd);
     close(out_fd);
