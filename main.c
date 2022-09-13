@@ -1,3 +1,27 @@
+/**
+ * MIT License
+ *
+ * Copyright (c) 2022 0xfff0
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ **/
+
 #include <openssl/conf.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
@@ -27,7 +51,8 @@
  * "... the amount of data written can be anything from zero bytes
  * to (inl + cipher_block_size - 1) bytes."
  */
-#define CHUNK_BUF_SIZE  (ENC_CHUNK_SIZE + 1024)
+#define PAGE_SIZE       (1U << 12)
+#define CHUNK_BUF_SIZE  ((ENC_CHUNK_SIZE + PAGE_SIZE) & ~(PAGE_SIZE - 1))
 
 #define KDF_ITER        10000
 #define EVP_OK          1
@@ -144,9 +169,9 @@ static void *worker(void *unused)
     unsigned curr_chunk_size;
     unsigned my_seq;
 
-    CHECK((input_data  = malloc(CHUNK_BUF_SIZE)) != NULL, "Unable to allocate per-thread scratch buffer.\n");
-    CHECK((output_data = malloc(CHUNK_BUF_SIZE)) != NULL, "Unable to allocate per-thread scratch buffer.\n");
-      
+    CHECK_ERRNO(posix_memalign( (void **)&input_data, PAGE_SIZE, CHUNK_BUF_SIZE) == 0, "posix_memalign(): ");
+    CHECK_ERRNO(posix_memalign((void **)&output_data, PAGE_SIZE, CHUNK_BUF_SIZE) == 0, "posix_memalign(): ");
+
     while (1) {
         CHECK_ERRNO(pthread_mutex_lock(&read_lock) == 0, "pthread_mutex_lock (read): ");
         if((bytes_read = fread(input_data, 1, enc ? ENC_CHUNK_SIZE : 4, in_fp)) > 0) {
@@ -230,7 +255,7 @@ int main(int argc, char **argv)
     int i, c;
     char *in_fname = NULL;
     char *out_fname = NULL;
-    short concurrency = 1;
+    short concurrency = 0;
 
     pthread_t *threads;
 
@@ -255,6 +280,9 @@ int main(int argc, char **argv)
         default:
             abort();
         }
+    }
+    if (concurrency == 0) {
+        concurrency = sysconf(_SC_NPROCESSORS_ONLN) * 2;
     }
     CHECK(optind < argc, "Missing mode (dec/enc).\n");
     CHECK(in_fname && out_fname, "Missing input/output file.\n");
