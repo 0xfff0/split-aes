@@ -31,12 +31,27 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <linux/mman.h>
 #include <openssl/conf.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+
+#if defined(__APPLE__) && defined(__MACH__)
+    #include <TargetConditionals.h>
+    #ifdef TARGET_OS_MAC
+        #include <sys/mman.h>
+        #ifndef MAP_HUGE_2MB
+            #define MAP_HUGE_2MB (0) // XXX: Not available on macOS
+        #endif
+    #else
+        #error "Unsupported platform"
+    #endif
+#elif __linux__
+    #include <linux/mman.h>
+#else
+    #error "Unsupported platform"
+#endif
 
 #define KEY_SIZE        256
 #define IV_SIZE         128
@@ -45,6 +60,7 @@
 #define KEY_LEN_BYTES   (KEY_SIZE/8)
 #define IV_LEN_BYTES    (IV_SIZE/8)
 #define SALT_LEN_BYTES  (SALT_SIZE/8)
+
 
 /**
  * ENC_PLAINTEXT_SIZE:
@@ -123,7 +139,7 @@ static unsigned char *out_mmap_addr;
 static size_t in_fsize;
 static size_t out_fsize_actual;
 static size_t out_fsize_max;
-static volatile unsigned sequence_num;
+static unsigned long sequence_num;
 
 void gen_256_key(         char *passphrase, int p_len,
                  unsigned char *salt,       int s_len,
@@ -191,9 +207,9 @@ static void *worker(void *unused)
     unsigned char key[KEY_LEN_BYTES];
     unsigned bytes_in_exp, bytes_in_actual;
     unsigned bytes_out_exp;
-    unsigned bytes_written;
+    unsigned num_bytes;
+    unsigned long my_seq;
     unsigned long read_offset;
-    volatile unsigned my_seq;
 
     bytes_in_exp  = enc ? ENC_PLAINTEXT_SIZE   : ENC_FINAL_CHUNK_SIZE;
     bytes_out_exp = enc ? ENC_FINAL_CHUNK_SIZE : ENC_PLAINTEXT_SIZE;
@@ -211,12 +227,13 @@ static void *worker(void *unused)
 
     while (1) {
         my_seq = __atomic_fetch_add(&sequence_num, 1, __ATOMIC_SEQ_CST);
+
         read_offset = (unsigned long)my_seq * bytes_in_exp;
         if (read_offset >= in_fsize) {
             break;
         }
-        in_start_addr  = in_mmap_addr + read_offset;
-        out_start_addr = out_mmap_addr + bytes_out_exp * my_seq;
+        in_start_addr  = in_mmap_addr  + read_offset;
+        out_start_addr = out_mmap_addr + (unsigned long)bytes_out_exp * my_seq;
 
         bytes_in_actual = read_offset + bytes_in_exp < in_fsize ? bytes_in_exp : in_fsize - read_offset;
 
@@ -240,29 +257,29 @@ static void *worker(void *unused)
             CHECK(RAND_bytes(  iv,   sizeof iv) == EVP_OK, "Failed to retrieve nonce");
             gen_256_key(pass, strlen(pass), salt, sizeof salt, key);
             aes_256_cbc_encrypt(in_start_addr, bytes_in_actual, key, iv,
-                                out_start_addr + IV_LEN_BYTES + SALT_LEN_BYTES, (int *)&bytes_written);
-            CHECK(bytes_written == ENC_PLAINTEXT_SIZE + 16 || bytes_in_exp > bytes_in_actual,
+                                out_start_addr + IV_LEN_BYTES + SALT_LEN_BYTES, (int *)&num_bytes);
+            CHECK(num_bytes == ENC_PLAINTEXT_SIZE + 16 || bytes_in_exp > bytes_in_actual,
                   "Unexpected cipher text length.");
 
             memcpy((void *)out_start_addr, (void *)iv, IV_LEN_BYTES);
             memcpy((void *)out_start_addr + IV_LEN_BYTES, (void *)salt, SALT_LEN_BYTES);
 
-            bytes_written += IV_LEN_BYTES + SALT_LEN_BYTES;
+            num_bytes += IV_LEN_BYTES + SALT_LEN_BYTES;
         } else {
             memcpy((void *)iv, (void *)in_start_addr, IV_LEN_BYTES);
             memcpy((void *)salt, (void *)(in_start_addr + IV_LEN_BYTES), SALT_LEN_BYTES);
             gen_256_key(pass, strlen(pass), salt, sizeof salt, key);
             aes_256_cbc_decrypt(in_start_addr + IV_LEN_BYTES + SALT_LEN_BYTES,
                                 bytes_in_actual - IV_LEN_BYTES - SALT_LEN_BYTES,
-                                key, iv, scratch, (int *)&bytes_written);
-            memcpy((void *)out_start_addr, (void *)scratch, bytes_written);
-            CHECK(bytes_written == ENC_PLAINTEXT_SIZE || bytes_in_exp > bytes_in_actual,
+                                key, iv, scratch, (int *)&num_bytes);
+            memcpy((void *)out_start_addr, (void *)scratch, num_bytes);
+            CHECK(num_bytes == ENC_PLAINTEXT_SIZE || bytes_in_exp > bytes_in_actual,
                   "Unexpected plaintext length.");
         }
-        __atomic_fetch_add(&out_fsize_actual, bytes_written, __ATOMIC_SEQ_CST);
+        __atomic_fetch_add(&out_fsize_actual, num_bytes, __ATOMIC_SEQ_CST);
 
         if (verbose) {
-            printf("Chunk %5u: encoded size %10u S/IV: ", my_seq, bytes_written);
+            printf("Chunk %5lu: encoded size %10u S/IV: ", my_seq, num_bytes);
             PRINT_STATIC_BYTES(salt); printf("/"); PRINT_STATIC_BYTES(iv);
             printf("\n");
         }
@@ -275,6 +292,7 @@ static void *worker(void *unused)
 int main(int argc, char **argv)
 {
     int i, c, in_fd, out_fd;
+    int mmap_flags;
     char *in_fname = NULL;
     char *out_fname = NULL;
     short concurrency = 0;
@@ -329,15 +347,35 @@ int main(int argc, char **argv)
     CHECK_ERRNO(in_fd != -1, "open()");
     CHECK_ERRNO(fstat(in_fd, &fs) != -1, "fstat()");
     in_fsize = fs.st_size;
-    in_mmap_addr = mmap(NULL, in_fsize, PROT_READ, MAP_PRIVATE | MAP_HUGE_2MB, in_fd, 0);
+#ifndef TARGET_OS_MAC
+    mmap_flags = MAP_PRIVATE | MAP_HUGE_2MB;
+#else
+    mmap_flags = MAP_PRIVATE;
+#endif
+    in_mmap_addr = mmap(NULL, in_fsize, PROT_WRITE, mmap_flags, in_fd, 0);
     CHECK_ERRNO(in_mmap_addr != MAP_FAILED, "mmap() input");
 
     out_fd = open(out_fname, O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
     CHECK_ERRNO(out_fd != -1, "open()");
 
     out_fsize_max = (in_fsize / ENC_FINAL_CHUNK_SIZE + 1) * ENC_FINAL_CHUNK_SIZE;
+#ifndef TARGET_OS_MAC
     CHECK_ERRNO(posix_fallocate(out_fd, 0, out_fsize_max) == 0, "fallocate()");
-    out_mmap_addr = mmap(NULL, out_fsize_max, PROT_WRITE, MAP_SHARED | MAP_HUGE_2MB, out_fd, 0);
+#else
+    /**
+     * posix_fallocate() is not available on macOS; simulate file allocation by
+     * creating a sparse file.
+     */
+    CHECK(lseek(out_fd, out_fsize_max - 1, SEEK_SET) == out_fsize_max - 1 &&
+          write(out_fd, "\0", 1) == 1, "Unable to allocate output file.");
+#endif
+
+#ifndef TARGET_OS_MAC
+    mmap_flags = MAP_SHARED | MAP_HUGE_2MB;
+#else
+    mmap_flags = MAP_SHARED;
+#endif
+    out_mmap_addr = mmap(NULL, out_fsize_max, PROT_WRITE, mmap_flags, out_fd, 0);
     CHECK_ERRNO(out_mmap_addr != MAP_FAILED, "mmap() output");
 
     CHECK((threads = malloc(concurrency * sizeof(*threads))) != NULL,
