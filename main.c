@@ -41,9 +41,6 @@
     #include <TargetConditionals.h>
     #ifdef TARGET_OS_MAC
         #include <sys/mman.h>
-        #ifndef MAP_HUGE_2MB
-            #define MAP_HUGE_2MB (0) // XXX: Not available on macOS
-        #endif
     #else
         #error "Unsupported platform"
     #endif
@@ -292,7 +289,6 @@ static void *worker(void *unused)
 int main(int argc, char **argv)
 {
     int i, c, in_fd, out_fd;
-    int mmap_flags;
     char *in_fname = NULL;
     char *out_fname = NULL;
     short concurrency = 0;
@@ -347,12 +343,7 @@ int main(int argc, char **argv)
     CHECK_ERRNO(in_fd != -1, "open()");
     CHECK_ERRNO(fstat(in_fd, &fs) != -1, "fstat()");
     in_fsize = fs.st_size;
-#ifndef TARGET_OS_MAC
-    mmap_flags = MAP_PRIVATE | MAP_HUGE_2MB;
-#else
-    mmap_flags = MAP_PRIVATE;
-#endif
-    in_mmap_addr = mmap(NULL, in_fsize, PROT_WRITE, mmap_flags, in_fd, 0);
+    in_mmap_addr = mmap(NULL, in_fsize, PROT_WRITE, MAP_PRIVATE, in_fd, 0);
     CHECK_ERRNO(in_mmap_addr != MAP_FAILED, "mmap() input");
 
     out_fd = open(out_fname, O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR);
@@ -370,12 +361,7 @@ int main(int argc, char **argv)
           write(out_fd, "\0", 1) == 1, "Unable to allocate output file.");
 #endif
 
-#ifndef TARGET_OS_MAC
-    mmap_flags = MAP_SHARED | MAP_HUGE_2MB;
-#else
-    mmap_flags = MAP_SHARED;
-#endif
-    out_mmap_addr = mmap(NULL, out_fsize_max, PROT_WRITE, mmap_flags, out_fd, 0);
+    out_mmap_addr = mmap(NULL, out_fsize_max, PROT_WRITE, MAP_SHARED, out_fd, 0);
     CHECK_ERRNO(out_mmap_addr != MAP_FAILED, "mmap() output");
 
     CHECK((threads = malloc(concurrency * sizeof(*threads))) != NULL,
